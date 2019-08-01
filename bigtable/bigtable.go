@@ -21,7 +21,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"strconv"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/bigtable/internal/gax"
@@ -43,10 +46,15 @@ const prodAddr = "bigtable.googleapis.com:443"
 //
 // A Client is safe to use concurrently, except for its Close method.
 type Client struct {
-	conn              *grpc.ClientConn
-	client            btpb.BigtableClient
+	rr                uint32
+	scs               []*subClient
 	project, instance string
 	appProfile        string
+}
+
+type subClient struct {
+	conn   *grpc.ClientConn
+	client btpb.BigtableClient
 }
 
 // ClientConfig has configurations for the client.
@@ -64,36 +72,54 @@ func NewClient(ctx context.Context, project, instance string, opts ...option.Cli
 
 // NewClientWithConfig creates a new client with the given config.
 func NewClientWithConfig(ctx context.Context, project, instance string, config ClientConfig, opts ...option.ClientOption) (*Client, error) {
+	c := &Client{
+		project:    project,
+		instance:   instance,
+		appProfile: config.AppProfile,
+	}
+
 	o, err := btopt.DefaultClientOptions(prodAddr, Scope, clientUserAgent)
 	if err != nil {
 		return nil, err
 	}
 	// Default to a small connection pool that can be overridden.
 	o = append(o,
-		option.WithGRPCConnectionPool(4),
+		//option.WithGRPCConnectionPool(4),
 		// Set the max size to correspond to server-side limits.
 		option.WithGRPCDialOption(grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(1<<28), grpc.MaxCallRecvMsgSize(1<<28))),
 		// TODO(grpc/grpc-go#1388) using connection pool without WithBlock
 		// can cause RPCs to fail randomly. We can delete this after the issue is fixed.
 		option.WithGRPCDialOption(grpc.WithBlock()))
 	o = append(o, opts...)
-	conn, err := gtransport.Dial(ctx, o...)
-	if err != nil {
-		return nil, fmt.Errorf("dialing: %v", err)
+
+	for i := 0; i < 4; i++ {
+		log.Printf("Dialing %v conn", i)
+		conn, err := gtransport.Dial(ctx, o...)
+		if err != nil {
+			return nil, fmt.Errorf("dialing: %v", err)
+		}
+
+		c.scs = append(c.scs, &subClient{
+			conn:   conn,
+			client: btpb.NewBigtableClient(conn),
+		})
 	}
 
-	return &Client{
-		conn:       conn,
-		client:     btpb.NewBigtableClient(conn),
-		project:    project,
-		instance:   instance,
-		appProfile: config.AppProfile,
-	}, nil
+	return c, nil
 }
 
 // Close closes the Client.
 func (c *Client) Close() error {
-	return c.conn.Close()
+	var errstrings []string
+	for _, sc := range c.scs {
+		if err := sc.conn.Close(); err != nil {
+			errstrings = append(errstrings, err.Error())
+		}
+	}
+	if len(errstrings) > 0 {
+		return fmt.Errorf(strings.Join(errstrings, "\n"))
+	}
+	return nil
 }
 
 var (
@@ -113,6 +139,13 @@ func init() {
 
 func (c *Client) fullTableName(table string) string {
 	return fmt.Sprintf("projects/%s/instances/%s/tables/%s", c.project, c.instance, table)
+}
+
+func (c *Client) rrNext() *subClient {
+	if len(c.scs) <= 0 {
+		return nil
+	}
+	return c.scs[atomic.AddUint32(&c.rr, 1)%uint32(len(c.scs))]
 }
 
 // A Table refers to a table.
@@ -169,7 +202,10 @@ func (t *Table) ReadRows(ctx context.Context, arg RowSet, f func(Row) bool, opts
 		defer cancel()
 
 		startTime := time.Now()
-		stream, err := t.c.client.ReadRows(ctx, req)
+
+		sc := t.c.rrNext()
+		stream, err := sc.client.ReadRows(ctx, req)
+
 		if err != nil {
 			return err
 		}
@@ -479,6 +515,9 @@ func (t *Table) Apply(ctx context.Context, row string, m *Mutation, opts ...Appl
 	ctx = trace.StartSpan(ctx, "cloud.google.com/go/bigtable/Apply")
 	defer func() { trace.EndSpan(ctx, err) }()
 	var callOptions []gax.CallOption
+
+	sc := t.c.rrNext()
+
 	if m.cond == nil {
 		req := &btpb.MutateRowRequest{
 			TableName:    t.c.fullTableName(t.table),
@@ -492,7 +531,7 @@ func (t *Table) Apply(ctx context.Context, row string, m *Mutation, opts ...Appl
 		var res *btpb.MutateRowResponse
 		err := gax.Invoke(ctx, func(ctx context.Context) error {
 			var err error
-			res, err = t.c.client.MutateRow(ctx, req)
+			res, err = sc.client.MutateRow(ctx, req)
 			return err
 		}, callOptions...)
 		if err == nil {
@@ -525,7 +564,7 @@ func (t *Table) Apply(ctx context.Context, row string, m *Mutation, opts ...Appl
 	var cmRes *btpb.CheckAndMutateRowResponse
 	err = gax.Invoke(ctx, func(ctx context.Context) error {
 		var err error
-		cmRes, err = t.c.client.CheckAndMutateRow(ctx, req)
+		cmRes, err = sc.client.CheckAndMutateRow(ctx, req)
 		return err
 	}, callOptions...)
 	if err == nil {
@@ -717,6 +756,7 @@ func (t *Table) doApplyBulk(ctx context.Context, entryErrs []*entryErr, opts ...
 		}
 	}
 
+	sc := t.c.rrNext()
 	entries := make([]*btpb.MutateRowsRequest_Entry, len(entryErrs))
 	for i, entryErr := range entryErrs {
 		entries[i] = entryErr.Entry
@@ -726,7 +766,7 @@ func (t *Table) doApplyBulk(ctx context.Context, entryErrs []*entryErr, opts ...
 		AppProfileId: t.c.appProfile,
 		Entries:      entries,
 	}
-	stream, err := t.c.client.MutateRows(ctx, req)
+	stream, err := sc.client.MutateRows(ctx, req)
 	if err != nil {
 		return err
 	}
@@ -807,13 +847,14 @@ func (ts Timestamp) TruncateToMilliseconds() Timestamp {
 // It returns the newly written cells.
 func (t *Table) ApplyReadModifyWrite(ctx context.Context, row string, m *ReadModifyWrite) (Row, error) {
 	ctx = mergeOutgoingMetadata(ctx, t.md)
+	sc := t.c.rrNext()
 	req := &btpb.ReadModifyWriteRowRequest{
 		TableName:    t.c.fullTableName(t.table),
 		AppProfileId: t.c.appProfile,
 		RowKey:       []byte(row),
 		Rules:        m.ops,
 	}
-	res, err := t.c.client.ReadModifyWriteRow(ctx, req)
+	res, err := sc.client.ReadModifyWriteRow(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -875,6 +916,7 @@ func mergeOutgoingMetadata(ctx context.Context, md metadata.MD) context.Context 
 // the table of approximately equal size, which can be used to break up the data for distributed tasks like mapreduces.
 func (t *Table) SampleRowKeys(ctx context.Context) ([]string, error) {
 	ctx = mergeOutgoingMetadata(ctx, t.md)
+	sc := t.c.rrNext()
 	var sampledRowKeys []string
 	err := gax.Invoke(ctx, func(ctx context.Context) error {
 		sampledRowKeys = nil
@@ -885,7 +927,7 @@ func (t *Table) SampleRowKeys(ctx context.Context) ([]string, error) {
 		ctx, cancel := context.WithCancel(ctx) // for aborting the stream
 		defer cancel()
 
-		stream, err := t.c.client.SampleRowKeys(ctx, req)
+		stream, err := sc.client.SampleRowKeys(ctx, req)
 		if err != nil {
 			return err
 		}
